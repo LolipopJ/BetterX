@@ -239,6 +239,105 @@
     return error;
   }
 
+  const SHORT_LINK_HOSTS = [
+    't.co', 't.cn', 'x.gd', 'bit.ly', 'c1n.cn', 'tinyurl.com', 'shrturi.com', 'dub.sh',
+    'is.gd', 'v.gd', 'ow.ly', 't.ly', 'cutt.ly', 'rb.gy', 'reurl.cc', 'url.cn', 'suo.im',
+  ];
+  const SHORT_LINK_RESOLVE_TIMEOUT_MS = 6000;
+  const SHORT_LINK_CACHE_KEY = 'betterx_short_links';
+  const SHORT_LINK_CACHE_TTL_MS = 365 * 24 * 60 * 60 * 1000;
+  const SHORT_LINK_CACHE_LIMIT = 300;
+  let shortLinkCache = null;
+
+  function isShortUrl(url) {
+    try {
+      const host = new URL(url).hostname.toLowerCase().replace(/\.$/, '');
+      return SHORT_LINK_HOSTS.some((domain) => host === domain || host.endsWith('.' + domain));
+    } catch { return false; }
+  }
+
+  function authorLinkLabel(href) {
+    try {
+      const { hostname, pathname, search } = new URL(href);
+      const text = hostname.replace(/^www\./, '') + pathname.replace(/\/$/, '') + search;
+      return text.length > 40 ? text.slice(0, 39) + '…' : text;
+    } catch { return href; }
+  }
+
+  function resolvedLinkUrl(candidate, original) {
+    try {
+      const { href, protocol } = new URL(candidate);
+      // 只换协议（http→https）的跳转仍停在短链服务商，继续解析没有意义。
+      if ((protocol !== 'http:' && protocol !== 'https:') || href === original || isShortUrl(href)) return '';
+      return href;
+    } catch { return ''; }
+  }
+
+  function requestShortUrlRedirect(method, url, timeout) {
+    return new Promise((resolve, reject) => {
+      try {
+        GM_xmlhttpRequest({
+          method, url, timeout, anonymous: true,
+          onload: (response) => resolve(response || {}),
+          onerror: () => reject(new Error('short link network error')),
+          ontimeout: () => reject(new Error('short link timeout')),
+          onabort: () => reject(new Error('short link aborted')),
+        });
+      } catch (error) { reject(error); }
+    });
+  }
+
+  function readShortLinkCache() {
+    if (!shortLinkCache) {
+      shortLinkCache = {};
+      try {
+        const stored = GM_getValue(SHORT_LINK_CACHE_KEY, null);
+        if (stored && typeof stored === 'object' && !Array.isArray(stored)) shortLinkCache = stored;
+      } catch {}
+    }
+    return shortLinkCache;
+  }
+
+  function getCachedShortLink(url) {
+    const entry = readShortLinkCache()[url];
+    if (!Number.isFinite(entry?.expiresAt) || entry.expiresAt <= now()) return '';
+    return resolvedLinkUrl(entry.href, url);
+  }
+
+  // 短链还原结果单独存一年：资料缓存过期后重新抓取也能直接复用，不再打短链服务商。
+  function rememberShortLink(url, href) {
+    const cache = readShortLinkCache();
+    cache[url] = { href, expiresAt: now() + SHORT_LINK_CACHE_TTL_MS };
+    const keys = Object.keys(cache);
+    if (keys.length > SHORT_LINK_CACHE_LIMIT) {
+      for (const key of keys) if (!(cache[key]?.expiresAt > now())) delete cache[key];
+      const overflow = Object.keys(cache).sort((left, right) => cache[left].expiresAt - cache[right].expiresAt);
+      while (overflow.length > SHORT_LINK_CACHE_LIMIT) delete cache[overflow.shift()];
+    }
+    try { GM_setValue(SHORT_LINK_CACHE_KEY, cache); } catch {}
+  }
+
+  // HEAD 最省流量，但部分短链服务商拒绝 HEAD 或不带跳转响应，回退 GET 时共享同一超时预算。
+  async function resolveShortUrl(url, timeoutMs = SHORT_LINK_RESOLVE_TIMEOUT_MS) {
+    if (!isShortUrl(url)) return url;
+    const cached = getCachedShortLink(url);
+    if (cached) return cached;
+    const deadline = Date.now() + timeoutMs;
+    for (const method of ['HEAD', 'GET']) {
+      const timeout = deadline - Date.now();
+      if (timeout <= 0) break;
+      try {
+        const { finalUrl } = await requestShortUrlRedirect(method, url, timeout);
+        const resolved = resolvedLinkUrl(finalUrl, url);
+        if (resolved) {
+          rememberShortLink(url, resolved);
+          return resolved;
+        }
+      } catch {}
+    }
+    return url;
+  }
+
   async function requestAuthorProfileLinks(screenName) {
     const params = new URLSearchParams({
       variables: JSON.stringify({ screen_name: screenName, withGrokTranslatedBio: true }),
@@ -277,7 +376,23 @@
         } catch {}
       }
     }
-    return [...links.values()];
+    return resolveAuthorProfileLinks([...links.values()]);
+  }
+
+  function isShortLinkLabel(label) {
+    const text = String(label || '').trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/^\/+/, '');
+    return text ? isShortUrl('https://' + text) : false;
+  }
+
+  async function resolveAuthorProfileLinks(links) {
+    if (!links.some((link) => isShortUrl(link.href))) return links;
+    const resolved = await Promise.all(links.map(async (link) => {
+      const finalHref = await resolveShortUrl(link.href);
+      if (finalHref === link.href) return link;
+      // 短链形式的面板标签跟随真实地址，平台图标由解析后的域名决定。
+      return { href: finalHref, label: isShortLinkLabel(link.label) ? authorLinkLabel(finalHref) : link.label };
+    }));
+    return [...new Map(resolved.map((link) => [link.href, link])).values()];
   }
 
   function notificationUserFromRest(raw, enabled) {

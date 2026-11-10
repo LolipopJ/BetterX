@@ -87,7 +87,11 @@
           ? mutation.target
           : mutation.target && mutation.target.parentElement;
         if (state.settings.authorLinksEnabled && mutation.type === 'attributes'
-            && mutationElement?.closest('article[data-testid="tweet"]')) pendingRoots.add(mutationElement);
+            && mutationElement?.closest('article[data-testid="tweet"]')) {
+          // 虚拟列表会复用 article 节点：作者链接变了就要重新评估首页缓存按钮。
+          delete mutationElement.closest('article[data-testid="tweet"]').dataset.betterxAuthorLinks;
+          pendingRoots.add(mutationElement);
+        }
         if (dismissWidgetsActive() && mutationElement
             && !mutationElement.closest('article, [data-testid="tweet"], #BetterX-root')) {
           const widgetRoot = mutationElement.closest(DISMISS_WIDGET_MUTATION_SCOPE);

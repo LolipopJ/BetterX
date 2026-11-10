@@ -97,4 +97,279 @@ function harness(){
   context.payload={errors:[{message:'rate limited'}]};
   await assert.rejects(context.__test.requestAuthorProfileLinks('author'),/no readable author profile/);
 }
-console.log('Author links cache empty results, bound retries, recover on demand and ignore obsolete responses; profile parsers validate and deduplicate links.');
+{
+  const calls=[];
+  const store=new Map();
+  const context=loadUserscript('isShortUrl, resolveShortUrl','now=()=>globalThis.clock;',{
+    clock:100000,
+    GM_getValue:(key,fallback)=>store.get(key)??fallback,
+    GM_setValue:(key,value)=>store.set(key,value),
+    GM_xmlhttpRequest:options=>{
+      calls.push({method:options.method,timeout:options.timeout});
+      if(options.method==='HEAD'){options.onerror();return;}
+      options.onload({status:200,finalUrl:'https://www.pixiv.net/users/123'});
+    },
+  });
+  const {isShortUrl:isShort,resolveShortUrl:resolve}=context.__test;
+  for(const url of ['https://t.co/abc','https://t.cn/abc','https://x.gd/abc','https://bit.ly/abc','https://c1n.cn/abc',
+    'https://tinyurl.com/abc','https://shrturi.com/abc','https://dub.sh/abc'])assert.ok(isShort(url),`${url} must be treated as a short link`);
+  for(const url of ['https://www.pixiv.net/users/123','https://example.org/t.cn','not a url'])assert.ok(!isShort(url),`${url} must not be treated as a short link`);
+  assert.equal(await resolve('https://t.co/abc'),'https://www.pixiv.net/users/123','A failed HEAD must fall back to GET');
+  assert.deepEqual(calls.map(call=>call.method),['HEAD','GET']);
+  assert.ok(calls.every(call=>call.timeout>0&&call.timeout<=6000),'Short link requests must respect the 6s budget');
+  const dictionary=store.get('betterx_short_links');
+  assert.equal(dictionary['https://t.co/abc'].href,'https://www.pixiv.net/users/123','Resolved short links must be remembered');
+  assert.equal(dictionary['https://t.co/abc'].expiresAt,context.clock+365*24*60*60*1000,'Resolved short links are cached for one year');
+  calls.length=0;
+  assert.equal(await resolve('https://t.co/abc'),'https://www.pixiv.net/users/123');
+  assert.equal(calls.length,0,'A remembered short link must not be requested again');
+  assert.equal(await resolve('https://www.pixiv.net/users/123'),'https://www.pixiv.net/users/123');
+  assert.equal(calls.length,0,'Regular links must not trigger redirect requests');
+}
+{
+  for(const [label,respond] of [['network error',options=>options.onerror()],['timeout',options=>options.ontimeout()],
+    ['unsafe redirect',options=>options.onload({status:200,finalUrl:'javascript:alert(1)'})],
+    ['missing final url',options=>options.onload({status:200})]]){
+    const context=loadUserscript('resolveShortUrl','',{GM_xmlhttpRequest:respond});
+    assert.equal(await context.__test.resolveShortUrl('https://bit.ly/abc'),'https://bit.ly/abc',`${label} must keep the original short link`);
+    assert.equal(await context.__test.resolveShortUrl('https://bit.ly/abc',0),'https://bit.ly/abc','An exhausted timeout budget must not throw');
+  }
+  const throwing=loadUserscript('resolveShortUrl','',{GM_xmlhttpRequest:()=>{throw new Error('blocked');}});
+  assert.equal(await throwing.__test.resolveShortUrl('https://bit.ly/abc'),'https://bit.ly/abc','A blocked request API must fall back silently');
+}
+{
+  const shortUrl='https://t.co/AbCdEf';
+  const profile={legacy:{entities:{url:{urls:[
+    {expanded_url:shortUrl,display_url:'t.co/AbCdEf'},
+    {expanded_url:'https://example.org/',display_url:'example.org'},
+  ]}}}};
+  const calls=[];
+  const context=loadUserscript('requestAuthorProfileLinks','requestXSessionJson=async()=>globalThis.payload;',{
+    payload:{data:{user:{result:profile}}},
+    GM_xmlhttpRequest:options=>{calls.push(options.url);options.onload({status:200,finalUrl:'https://www.pixiv.net/users/123'});},
+  });
+  const result=await context.__test.requestAuthorProfileLinks('author');
+  assert.deepEqual(Array.from(result,link=>link.href),['https://www.pixiv.net/users/123','https://example.org/']);
+  assert.equal(result[0].label,'pixiv.net/users/123','Short link labels must follow the resolved host');
+  assert.deepEqual(calls,[shortUrl],'Only short links trigger redirect requests');
+}
+{
+  const shortUrl='https://bit.ly/xyz';
+  const profile={legacy:{entities:{url:{urls:[{expanded_url:shortUrl,display_url:'bit.ly/xyz'}]}}}};
+  const context=loadUserscript('requestAuthorProfileLinks','requestXSessionJson=async()=>globalThis.payload;',{
+    payload:{data:{user:{result:profile}}},
+    GM_xmlhttpRequest:options=>options.ontimeout(),
+  });
+  const result=await context.__test.requestAuthorProfileLinks('author');
+  assert.deepEqual(Array.from(result,link=>link.href),[shortUrl],'Failed resolution keeps the original short link');
+  assert.equal(result[0].label,'bit.ly/xyz','Failed resolution keeps the original label');
+}
+{
+  const profile={legacy:{entities:{url:{urls:[{expanded_url:'https://t.co/one'},{expanded_url:'https://t.co/two'}]}}}};
+  const context=loadUserscript('requestAuthorProfileLinks','requestXSessionJson=async()=>globalThis.payload;',{
+    payload:{data:{user:{result:profile}}},
+    GM_xmlhttpRequest:options=>options.onload({status:200,finalUrl:'https://www.pixiv.net/users/123'}),
+  });
+  const result=await context.__test.requestAuthorProfileLinks('author');
+  assert.deepEqual(Array.from(result,link=>link.href),['https://www.pixiv.net/users/123'],'Links converging on one target must collapse');
+}
+function homeHarness(profiles, transport = async () => []){
+  const created=[],articles=[],reads=[],redirects=[];
+  const stored=new Map(Object.entries(profiles));
+  const document={
+    body:null,cookie:'',documentElement:{lang:'zh-CN'},
+    createElement(tag){
+      const node={tagName:tag.toUpperCase(),children:[],dataset:{},attrs:new Map(),listeners:{},className:'',id:'',
+        style:{setProperty(key,value){this[key]=value;}},isConnected:true,parentElement:null,previousElementSibling:null,firstElementChild:null,
+        setAttribute(key,value){node.attrs.set(key,String(value));},
+        getAttribute(key){return node.attrs.get(key);},
+        addEventListener(type,fn){(node.listeners[type]=node.listeners[type]||[]).push(fn);},
+        append(...nodes){for(const child of nodes){child.parentElement=node;node.children.push(child);}node.firstElementChild=node.children[0];},
+        replaceChildren(...nodes){node.children=nodes;node.firstElementChild=nodes[0];},
+        querySelector(){return null;},
+        closest(){return null;},
+        remove(){node.isConnected=false;node.removed=true;},
+      };
+      created.push(node);
+      return node;
+    },
+    querySelectorAll(selector){
+      if(selector==='[data-betterx-author-links="home"]'){
+        return created.filter(node=>node.isConnected&&node.className==='BetterX-author-links'&&node.dataset.betterxAuthorLinks==='home');
+      }
+      if(selector==='[data-betterx-author-links="none"]'){
+        return articles.filter(node=>node.isConnected&&node.dataset.betterxAuthorLinks==='none');
+      }
+      if(selector==='[data-testid="primaryColumn"] article[data-testid="tweet"]')return articles.filter(node=>node.isConnected);
+      return [];
+    },
+  };
+  const context=loadUserscript('refreshAuthorLinks, getCachedAuthorProfileLinks, loadAuthorProfileLinks',
+    'now=()=>globalThis.clock;requestAuthorProfileLinks=async name=>{globalThis.requests++;return globalThis.transport(name);};',{
+      clock:100000,requests:0,document,transport,
+      GM_getValue:(key,fallback)=>{reads.push(key);return stored.get(key)??fallback;},
+      GM_setValue:(key,value)=>stored.set(key,value),
+      GM_xmlhttpRequest:options=>{
+        redirects.push(options.url);
+        options.onload({status:200,finalUrl:'https://www.pixiv.net/users/1'});
+      },
+      getComputedStyle:()=>({columnGap:'0',display:'flex',flexDirection:'row'}),
+    });
+  context.__test.state.settings.authorLinksEnabled=true;
+  context.location.pathname='/home';
+  const addArticle=(name)=>{
+    let control=null;
+    const caret={tagName:'BUTTON',isConnected:true,previousElementSibling:null,parentElement:null,
+      closest(selector){return selector==='article'?article:null;},
+      querySelector(){return null;},
+      getBoundingClientRect(){return {width:0,height:0};},
+      before(inserted){control=inserted;},
+    };
+    const article={isConnected:true,dataset:{},nameQueries:0,
+      closest(){return null;},
+      querySelector(selector){
+        if(selector==='[data-testid="User-Name"]'){
+          article.nameQueries++;
+          return {querySelector:()=>name?{pathname:'/'+name}:null};
+        }
+        if(selector==='button[data-testid="caret"]')return caret;
+        if(selector==='.BetterX-author-links')return control;
+        return null;
+      },
+      remove(){article.isConnected=false;},
+      get control(){return control;},
+    };
+    caret.parentElement=article;
+    articles.push(article);
+    return article;
+  };
+  return {context,api:context.__test,stored,reads,redirects,addArticle};
+}
+
+{
+  const h=homeHarness({'betterx_author_links:author':{links,expiresAt:200000}});
+  const article=h.addArticle('author');
+  h.api.refreshAuthorLinks();
+  assert.ok(article.control,'A cached author must get an entry button on the home timeline');
+  const [button,menu]=article.control.children;
+  assert.equal(menu.getAttribute('popover'),'auto');
+  assert.equal(button.getAttribute('popovertarget'),menu.id);
+  assert.deepEqual(Array.from(menu.children,link=>link.href),[links[0].href]);
+  assert.equal(h.context.requests,0,'The home timeline must never request author profiles');
+  h.context.location.pathname='/explore';
+  h.api.refreshAuthorLinks();
+  assert.equal(article.control.isConnected,false,'Leaving the home timeline must remove injected buttons');
+}
+{
+  const h=homeHarness({
+    'betterx_author_links:empty':{links:[],expiresAt:200000},
+    'betterx_author_links:expired':{links,expiresAt:90000},
+  });
+  const unknown=h.addArticle('unknown'),empty=h.addArticle('empty'),expired=h.addArticle('expired'),nameless=h.addArticle('');
+  h.api.refreshAuthorLinks();
+  for(const article of [unknown,empty,expired,nameless]){
+    assert.equal(article.control,null,'Only cached, unexpired and non-empty author links may render');
+  }
+  assert.equal(h.context.requests,0,'Uncached authors must stay silent on the home timeline');
+}
+{
+  const h=homeHarness({
+    'betterx_author_links:author':{links,expiresAt:200000},
+    'betterx_author_links:writer':{links:[{href:'https://github.com/writer',label:'github.com/writer'}],expiresAt:200000},
+  });
+  const first=h.addArticle('author'),second=h.addArticle('writer');
+  h.api.refreshAuthorLinks();
+  const [firstButton,firstMenu]=first.control.children,[secondButton,secondMenu]=second.control.children;
+  assert.notEqual(firstMenu.id,secondMenu.id,'Each tweet must own a distinct popover id');
+  assert.equal(firstButton.getAttribute('popovertarget'),firstMenu.id);
+  assert.equal(secondButton.getAttribute('popovertarget'),secondMenu.id);
+  assert.notEqual(firstButton.style['anchor-name'],secondButton.style['anchor-name'],'Anchors must not collide');
+  assert.equal(firstMenu.style['position-anchor'],firstButton.style['anchor-name']);
+  assert.deepEqual(Array.from(firstMenu.children,link=>link.href),[links[0].href]);
+  assert.deepEqual(Array.from(secondMenu.children,link=>link.href),['https://github.com/writer']);
+  h.api.refreshAuthorLinks();
+  assert.equal(first.control.children[1],firstMenu,'Repeated scans must reuse the injected control');
+}
+{
+  const h=homeHarness({'betterx_author_links:author':{links,expiresAt:200000}});
+  assert.deepEqual(Array.from(h.api.getCachedAuthorProfileLinks('author'),link=>link.href),[links[0].href]);
+  assert.equal(h.api.getCachedAuthorProfileLinks('missing'),null);
+  assert.equal(h.api.getCachedAuthorProfileLinks('bad name!'),null);
+  assert.equal(h.api.getCachedAuthorProfileLinks(''),null);
+}
+{
+  const h=homeHarness({'betterx_author_links:author':{links:[],expiresAt:200000}});
+  assert.equal(h.api.getCachedAuthorProfileLinks('author'),null);
+  assert.deepEqual(Array.from(await h.api.loadAuthorProfileLinks('author')),[]);
+  const authorReads=h.reads.filter(key=>key.startsWith('betterx_author_links:'));
+  assert.equal(authorReads.length,1,'A valid empty cache entry must stay in memory so the detail view hits it');
+  assert.equal(h.context.requests,0,'A valid empty cache entry must not refetch the profile');
+}
+{
+  const h=homeHarness({'betterx_author_links:author':{links:[{href:'https://t.co/old',label:'t.co/old'}],expiresAt:200000}});
+  const cached=h.api.getCachedAuthorProfileLinks('author');
+  assert.equal(cached[0].href,'https://t.co/old','The timeline renders the cached link before resolution');
+  await flush();
+  assert.deepEqual(h.redirects,['https://t.co/old'],'A legacy cached short link must still resolve from the timeline');
+  assert.equal(h.stored.get('betterx_author_links:author').links[0].href,'https://www.pixiv.net/users/1');
+}
+{
+  const h=homeHarness({},async()=>links);
+  const article=h.addArticle('unknown');
+  h.api.refreshAuthorLinks();
+  assert.equal(article.nameQueries,1,'The author node is read once per tweet');
+  h.api.refreshAuthorLinks();
+  assert.equal(article.nameQueries,1,'Tweets without cached links must not be re-read on every flush');
+  assert.equal(article.dataset.betterxAuthorLinks,'none');
+  await h.api.loadAuthorProfileLinks('unknown');
+  assert.equal(h.context.requests,1);
+  h.api.refreshAuthorLinks();
+  assert.ok(article.control,'A newly cached author must be picked up on the next scan');
+  assert.equal(article.dataset.betterxAuthorLinks,undefined,'The injected tweet must drop the negative marker');
+}
+{
+  const protocolOnly=loadUserscript('resolveShortUrl','',{
+    GM_xmlhttpRequest:options=>options.onload({status:200,finalUrl:'https://t.co/abc'}),
+  });
+  assert.equal(await protocolOnly.__test.resolveShortUrl('http://t.co/abc'),'http://t.co/abc','A protocol-only redirect must not count as resolved');
+  const chained=loadUserscript('resolveShortUrl','',{
+    GM_xmlhttpRequest:options=>options.onload({status:200,finalUrl:'https://bit.ly/still'}),
+  });
+  assert.equal(await chained.__test.resolveShortUrl('https://t.co/abc'),'https://t.co/abc','A redirect to another shortener must keep the original link');
+}
+{
+  const stored=new Map([['betterx_author_links:author',{links:[{href:'https://t.co/old',label:'t.co/old'}],expiresAt:200000}]]);
+  const requested=[];
+  const context=loadUserscript('loadAuthorProfileLinks','now=()=>globalThis.clock;',{
+    clock:100000,
+    GM_getValue:(key,fallback)=>stored.get(key)??fallback,
+    GM_setValue:(key,value)=>stored.set(key,value),
+    GM_xmlhttpRequest:options=>{requested.push(options.url);options.onload({status:200,finalUrl:'https://www.pixiv.net/users/1'});},
+  });
+  const cached=await context.__test.loadAuthorProfileLinks('author');
+  assert.equal(cached[0].href,'https://t.co/old','Cached links must render before the background resolution finishes');
+  await flush();
+  assert.deepEqual(requested,['https://t.co/old'],'Legacy caches holding short links must resolve once in the background');
+  const refreshed=stored.get('betterx_author_links:author');
+  assert.equal(refreshed.links[0].href,'https://www.pixiv.net/users/1','Resolved short links must be persisted');
+  assert.equal(refreshed.expiresAt,200000,'Overwriting a resolved cache entry must keep its original expiry');
+  assert.deepEqual(Object.keys(refreshed),['links','expiresAt'],'No migration marker may be stored');
+  await context.__test.loadAuthorProfileLinks('author');await flush();
+  assert.deepEqual(requested,['https://t.co/old'],'An already refreshed cache entry must not be requested again');
+}
+{
+  const stored=new Map([['betterx_author_links:author',{links:[{href:'https://t.co/old',label:'t.co/old'}],expiresAt:200000}]]);
+  const requested=[];
+  const context=loadUserscript('loadAuthorProfileLinks','now=()=>globalThis.clock;',{
+    clock:100000,
+    GM_getValue:(key,fallback)=>stored.get(key)??fallback,
+    GM_setValue:(key,value)=>stored.set(key,value),
+    GM_xmlhttpRequest:options=>{requested.push(options.method);options.onerror();},
+  });
+  await context.__test.loadAuthorProfileLinks('author');await flush();
+  assert.deepEqual(requested,['HEAD','GET'],'A failed resolution tries HEAD then GET once');
+  await context.__test.loadAuthorProfileLinks('author');await flush();
+  assert.equal(requested.length,2,'Failed short links must not be retried on every cache read');
+  assert.equal(stored.get('betterx_author_links:author').links[0].href,'https://t.co/old','A failed resolution leaves the cache untouched');
+}
+console.log('Author links cache empty results, bound retries, recover on demand and ignore obsolete responses; profile parsers validate and deduplicate links; short links resolve through HEAD/GET redirects, refresh labels, resolve legacy cached short links once in place without extending their expiry, reject protocol-only or chained shortener redirects and fall back on failures; the home timeline injects isolated cached-author menus without extra requests and skips re-scanning decided tweets.');

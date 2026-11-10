@@ -3,6 +3,8 @@
   const AUTHOR_LINKS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   const AUTHOR_LINKS_EMPTY_TTL_MS = 60 * 60 * 1000;
   const AUTHOR_LINKS_RETRY_DELAYS = [1000, 4000];
+  const AUTHOR_LINKS_MISS_TTL_MS = 30 * 1000;
+  const AUTHOR_LINKS_HOME_ROUTE = /^\/home\/?$/i;
   const AUTHOR_GROK_BUTTON = 'button:is([aria-label*="Grok" i], [data-testid*="grok" i])';
   const AUTHOR_LINK_SITE_LOGOS = [
     ['pixiv.net', 'pixiv/0096FA'],
@@ -23,8 +25,14 @@
   ];
   const authorLinksRequests = new Map();
   const authorLinksCache = new Map();
+  const authorLinksCacheMisses = new Map();
+  const authorLinksShortLinkAttempted = new Set();
+  let authorLinksControlSeq = 0;
   let authorLinksView = null;
   let authorLinksLifecycleInstalled = false;
+  let authorLinksHomeInjected = false;
+  let authorLinksGeneration = 0;
+  let authorLinksHomeGeneration = -1;
 
   async function loadAuthorProfileLinks(screenName) {
     screenName = screenName.toLowerCase();
@@ -35,6 +43,8 @@
     try {
       const cached = authorLinksCache.get(screenName) || GM_getValue(key, null);
       if (Number.isFinite(cached?.expiresAt) && cached.expiresAt > now() && Array.isArray(cached.links)) {
+        authorLinksCacheMisses.delete(screenName);
+        resolveCachedShortLinks(screenName, cached);
         return cached.links;
       }
     } catch {}
@@ -43,12 +53,61 @@
     const request = requestAuthorProfileLinks(screenName).then((links) => {
       const cached = { links, expiresAt: now() + (links.length ? AUTHOR_LINKS_CACHE_TTL_MS : AUTHOR_LINKS_EMPTY_TTL_MS) };
       authorLinksCache.set(screenName, cached);
+      authorLinksCacheMisses.delete(screenName);
+      if (links.length) authorLinksGeneration++;
       if (authorLinksCache.size > 200) authorLinksCache.delete(authorLinksCache.keys().next().value);
       try { GM_setValue(key, cached); } catch {}
       return links;
     }).finally(() => authorLinksRequests.delete(screenName));
     authorLinksRequests.set(screenName, request);
     return request;
+  }
+
+  // 缓存里还留着短链时后台还原一次，成功后原地覆写、保留原有过期时间。
+  function resolveCachedShortLinks(screenName, cached) {
+    if (!cached.links.some((link) => isShortUrl(link.href))) return;
+    // 失败也不重试：同一次页面会话内每个作者最多请求一轮，避免滚动时反复打短链服务商。
+    if (authorLinksShortLinkAttempted.has(screenName)) return;
+    authorLinksShortLinkAttempted.add(screenName);
+    resolveAuthorProfileLinks(cached.links).then((links) => {
+      const changed = links.length !== cached.links.length
+        || links.some((link, index) => link.href !== cached.links[index].href);
+      if (!changed) return;
+      const refreshed = { links, expiresAt: cached.expiresAt };
+      authorLinksCache.set(screenName, refreshed);
+      authorLinksGeneration++;
+      try { GM_setValue('betterx_author_links:' + screenName, refreshed); } catch {}
+    }).catch(() => {});
+  }
+
+  function rememberAuthorLinksMiss(screenName) {
+    authorLinksCacheMisses.set(screenName, now() + AUTHOR_LINKS_MISS_TTL_MS);
+    if (authorLinksCacheMisses.size > 500) authorLinksCacheMisses.delete(authorLinksCacheMisses.keys().next().value);
+  }
+
+  // 主页信息流只消费已有缓存：未命中也记下短期空结果，避免滚动时反复读取扩展存储。
+  function getCachedAuthorProfileLinks(screenName) {
+    screenName = String(screenName || '').toLowerCase();
+    if (!/^[a-z0-9_]{1,15}$/.test(screenName)) return null;
+    if (authorLinksCacheMisses.get(screenName) > now()) return null;
+    let cached = authorLinksCache.get(screenName);
+    if (!cached) {
+      try { cached = GM_getValue('betterx_author_links:' + screenName, null); } catch { cached = null; }
+    }
+    if (!cached || !Number.isFinite(cached.expiresAt) || cached.expiresAt <= now() || !Array.isArray(cached.links)) {
+      authorLinksCache.delete(screenName);
+      rememberAuthorLinksMiss(screenName);
+      return null;
+    }
+    if (!authorLinksCache.has(screenName)) {
+      authorLinksCache.set(screenName, cached);
+      if (authorLinksCache.size > 200) authorLinksCache.delete(authorLinksCache.keys().next().value);
+    }
+    authorLinksCacheMisses.delete(screenName);
+    resolveCachedShortLinks(screenName, cached);
+    // 有效但为空的缓存项本身就是负缓存，留在内存里让详情页直接命中，避免重复读取 GM 存储。
+    const links = cached.links.filter((link) => typeof link?.href === 'string' && /^https?:\/\//i.test(link.href));
+    return links.length ? links : null;
   }
 
   function isAuthorLinksCaret(caret, screenName, statusId, photo) {
@@ -109,7 +168,7 @@
     }
     button.style.width = width ? `${width}px` : '';
     button.style.height = height ? `${height}px` : '';
-    const rowGap = parseFloat(getComputedStyle(target.parentElement).columnGap);
+    const rowGap = target.parentElement ? parseFloat(getComputedStyle(target.parentElement).columnGap) : 0;
     const extraGap = rowGap > 0 ? 0 : 8;
     control.style.marginInlineEnd = extraGap + 'px';
     if (target.previousElementSibling !== control) target.before(control);
@@ -159,14 +218,17 @@
     const label = uiText(failed ? '作者链接加载失败，点击重试' : '作者链接');
     const control = document.createElement('span');
     control.className = 'BetterX-author-links';
-    control.addEventListener('click', (event) => {
-      const route = getAuthorLinksRoute();
-      if (!isActiveAuthorLinksView(view) || !isAuthorLinksCaret(view.caret, route.screenName, route.statusId, route.photo)) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        refreshAuthorLinks();
-      }
-    }, true);
+    if (!view.home) {
+      control.addEventListener('click', (event) => {
+        const route = getAuthorLinksRoute();
+        if (!isActiveAuthorLinksView(view) || !isAuthorLinksCaret(view.caret, route.screenName, route.statusId, route.photo)) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          refreshAuthorLinks();
+        }
+      }, true);
+    }
+    // 首页的推文卡片本身可点击跳转，菜单内的点击不能再冒泡到 X 的路由。
     control.addEventListener('click', (event) => event.stopPropagation());
 
     const button = document.createElement('button');
@@ -186,8 +248,13 @@
     }
 
     const menu = document.createElement('div');
-    menu.id = 'BetterX-author-links-menu';
+    menu.className = 'BetterX-author-links-menu';
+    // 主页可能同时存在多条缓存作者的推文，ID 与锚点名必须按控件唯一。
+    const seq = ++authorLinksControlSeq;
+    menu.id = 'BetterX-author-links-menu-' + seq;
     menu.setAttribute('popover', 'auto');
+    menu.style.setProperty('position-anchor', '--betterx-author-links-' + seq);
+    button.style.setProperty('anchor-name', '--betterx-author-links-' + seq);
     button.setAttribute('popovertarget', menu.id);
     for (const { href, label } of links) {
       const link = document.createElement('a');
@@ -211,6 +278,46 @@
     const [, handle, statusId, photoPath] = route;
     const screenName = handle.toLowerCase();
     return { screenName, statusId, photo: Boolean(photoPath), key: screenName + '/' + statusId };
+  }
+
+  function homeAuthorLinksActive() {
+    return Boolean(state.settings.authorLinksEnabled && AUTHOR_LINKS_HOME_ROUTE.test(location.pathname || ''));
+  }
+
+  function getArticleAuthorName(article) {
+    const path = article.querySelector('[data-testid="User-Name"]')?.querySelector('a[href]')?.pathname || '';
+    return /^\/[a-z0-9_]{1,15}\/?$/i.test(path) ? path.replace(/\//g, '').toLowerCase() : '';
+  }
+
+  function removeHomeAuthorLinks() {
+    if (!authorLinksHomeInjected) return;
+    authorLinksHomeInjected = false;
+    for (const control of document.querySelectorAll('[data-betterx-author-links="home"]')) control.remove();
+  }
+
+  // 首页只消费本地缓存：未缓存作者保持静默，避免滚动时向 X 发起成片请求触发限流。
+  function refreshHomeAuthorLinks() {
+    if (!homeAuthorLinksActive()) { removeHomeAuthorLinks(); return; }
+    if (authorLinksHomeGeneration !== authorLinksGeneration) {
+      authorLinksHomeGeneration = authorLinksGeneration;
+      // 缓存有新增：重新评估此前判定为“无缓存”的推文。
+      for (const article of document.querySelectorAll('[data-betterx-author-links="none"]')) delete article.dataset.betterxAuthorLinks;
+    }
+    for (const article of document.querySelectorAll('[data-testid="primaryColumn"] article[data-testid="tweet"]')) {
+      // 已注入控件或已确认无缓存的推文直接跳过，避免每次 DOM 变动都重查作者节点。
+      if (!article.isConnected || article.dataset.betterxAuthorLinks === 'none' || article.closest('#layers, [role="dialog"]')) continue;
+      if (article.querySelector('.BetterX-author-links')) continue;
+      const caret = article.querySelector('button[data-testid="caret"]');
+      if (!caret || caret.closest('[hidden], [aria-hidden="true"]')) continue;
+      const links = getCachedAuthorProfileLinks(getArticleAuthorName(article));
+      if (!links) { article.dataset.betterxAuthorLinks = 'none'; continue; }
+      const caretSlot = getAuthorLinksSlot(caret);
+      const control = createAuthorLinksControl(links, { home: true });
+      control.dataset.betterxAuthorLinks = 'home';
+      delete article.dataset.betterxAuthorLinks;
+      placeAuthorLinksControl({ home: true, caret, caretSlot, control, target: null }, getAuthorLinksTarget(caretSlot));
+      authorLinksHomeInjected = true;
+    }
   }
 
   function isActiveAuthorLinksView(view) {
@@ -258,6 +365,7 @@
   }
 
   function refreshAuthorLinks() {
+    refreshHomeAuthorLinks();
     const route = getAuthorLinksRoute();
     if (!route) { resetAuthorLinksView(); return; }
     if (!authorLinksLifecycleInstalled && typeof window.addEventListener === 'function') {
